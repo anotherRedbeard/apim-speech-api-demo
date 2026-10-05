@@ -1,0 +1,61 @@
+<!--
+  APIM operation policy: GET /speech/batch/synthesize/{id}
+
+  Purpose: poll the status of a previously submitted Batch synthesis job. Once
+  "status" is "Succeeded" in the returned JSON, download the audio from the
+  "outputs.result" URL in the response body directly (it is a Microsoft-generated,
+  time-limited SAS URL - not proxied back through APIM; see README for why).
+-->
+<policies>
+    <inbound>
+        <base />
+        <set-backend-service backend-id="speech-batch-backend" />
+
+        <!-- Remove the caller's APIM subscription key so it never reaches the Speech backend -->
+        <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+
+        <!-- Microsoft Entra auth for Batch synthesis uses a PLAIN bearer token (no aad# composition) -->
+        <authentication-managed-identity resource="https://cognitiveservices.azure.com" output-token-variable-name="speech-access-token" ignore-error="false" />
+        <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["speech-access-token"])</value>
+        </set-header>
+
+        <set-method>GET</set-method>
+        <rewrite-uri template="/texttospeech/batchsyntheses/{id}?api-version={{speech-batch-api-version}}" copy-unmatched-params="false" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+        <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+        </set-header>
+        <choose>
+            <when condition="@(context.LastError?.Source == "authentication-managed-identity")">
+                <set-status code="502" reason="Bad Gateway" />
+                <set-body>@{
+                    return new JObject(
+                        new JProperty("error", "backend_authentication_failed"),
+                        new JProperty("message", "APIM could not obtain a Microsoft Entra token for the Speech backend. Verify the managed identity has the 'Cognitive Services Speech User' role on the Speech resource."),
+                        new JProperty("details", context.LastError?.Message)
+                    ).ToString();
+                }</set-body>
+            </when>
+            <otherwise>
+                <set-status code="502" reason="Bad Gateway" />
+                <set-body>@{
+                    return new JObject(
+                        new JProperty("error", "speech_batch_gateway_error"),
+                        new JProperty("message", context.LastError?.Message ?? "An unexpected error occurred while contacting the Speech Batch synthesis backend."),
+                        new JProperty("source", context.LastError?.Source),
+                        new JProperty("reason", context.LastError?.Reason)
+                    ).ToString();
+                }</set-body>
+            </otherwise>
+        </choose>
+    </on-error>
+</policies>
